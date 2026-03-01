@@ -128,8 +128,6 @@ When they disagree, the keyword match wins. This ended up mattering more than I 
 uv run pytest evals/ -v
 ```
 
-These hit the real API (no mocking), so you need a valid key.
-
 ---
 
 ## Project Structure
