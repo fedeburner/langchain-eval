@@ -5,7 +5,7 @@ This started as a barebones CLI chat agent on [LangChain Deep Agents](https://gi
 The question I wanted to answer: **how do different memory approaches actually affect an agent's ability to recall facts, deal with contradictions, and hold context over long conversations?**
 
 ## Strategies used:
-**Full Buffer **is the simplest possible approach. It keeps every single message -- every user input and every agent response -- and sends the entire conversation to the model each turn. The advantage is obvious: the model always has full context, so it never forgets anything. The disadvantage is equally obvious: your token count grows linearly with conversation length. In our 26-turn Deep Conversation scenario, it went from 6,000 tokens to over 111,000. For a platform where agents run for hours every day, that's a cost and latency problem.
+**Full Buffer** is the simplest possible approach. It keeps every single message -- every user input and every agent response -- and sends the entire conversation to the model each turn. The advantage is obvious: the model always has full context, so it never forgets anything. The disadvantage is equally obvious: your token count grows linearly with conversation length. In our 26-turn Deep Conversation scenario, it went from 6,000 tokens to over 111,000. For a platform where agents run for hours every day, that's a cost and latency problem.
 
 **Summary** takes a different approach. It monitors the conversation's total token count, and when it crosses a threshold -- I set it to 4,000 tokens -- it calls the LLM to compress all the older messages into a running summary paragraph. After that, it sends the summary plus the most recent turns. So you get a compressed version of the history without the unbounded growth. The trade-off is that specific details can get lost in the compression -- the LLM might summarize 'the user has a wife named Sarah who is a nurse' into something more general, or drop it entirely if there's a lot of other content.
 
@@ -16,6 +16,37 @@ The question I wanted to answer: **how do different memory approaches actually a
 **Hybrid** tries to get the best of everything. It combines the Profile extractor, the Summary compressor, and a recent-turn window. The idea is that structured extraction catches user facts, summarization preserves general context, and the window keeps the most recent exchanges fresh. In theory this should dominate. In practice -- and this was one of the most surprising findings -- it doesn't always. It inherits the weaknesses of each component, and sometimes those weaknesses cancel out each other's strengths.
 
 **Window** is the most minimal strategy. It just keeps the last K exchanges -- I defaulted K to 6 -- and drops everything older. This gives you constant token usage regardless of conversation length, which is great for cost control. But any fact mentioned more than 6 turns ago is permanently lost. It's useful for low-context interactions where you genuinely don't need long-term recall.
+
+## Scenarios Tested:
+
+**Long-Range Recall** is the baseline scenario. The user states three facts -- their name, their dog's name and breed, and their city -- then asks five unrelated questions about Mongolia, airplanes, octopuses, things like that. Then we probe: 'What's my dog's name?' 'Where do I live?' This tests whether facts from early in the conversation survive after filler pushes them back.
+
+**Conflict Resolution** tests what happens when a fact changes. The user says 'I live in Austin,' then later says 'Actually I moved to Denver.' We probe for both the current and previous location. This catches strategies that might confuse old and new values.
+
+**Compositional Recall** requires the agent to combine facts from separate turns. The user mentions their name in one turn, their team in another turn, their favorite language in another. Then we ask 'What's my name and what team do I lead?' -- the agent has to pull from two different turns and synthesize.
+
+**Noise Robustnes**s buries two important facts -- an emergency contact name and a blood type -- under six turns of heavy irrelevant chatter, then probes for them. This tests whether the strategy can separate signal from noise.
+
+**Style Preference** checks whether the agent remembers meta-instructions, not just facts. The user says 'please use concise bullet points,' then asks a couple questions, then we probe whether the agent remembers the style preference and actually applies it. (**_Note_**: this was a cursor suggestion it snuck in. I decided to leave it in as an additional datapoint, but it's kinda tangential).
+
+**Cross-Session Memory **is the hardest. The user states three facts, then we simulate a session break -- all in-memory state is wiped. In the new session we probe for the facts, then the user updates one of them, then we do another session break and probe again. Only strategies with a persistence layer can survive this.
+
+**Deep Conversation** is the longest at 26 turns. The user states three facts at the very start -- their job, their wife's name, their cats' names -- then there are 20 filler turns asking about technical topics like DNS, OAuth, MapReduce. At the end, we probe for those original facts. This is where you really see the strategies diverge, because 20 filler turns is enough to push facts out of any window and enough to stress-test summarization quality.
+
+**Repeated Updates** changes the same fact three times. The user says 'I live in Austin,' then 'I moved to Denver,' then 'I relocated to Seattle.' We probe for the current city and the full history. This tests whether strategies can track the latest value and remember the sequence of changes.
+
+## MODEL USED:
+Everything runs on Claude Haiku. I chose it because it's fast and cheap enough to run all 48 trials, which is about 6 million tokens (which ended up being between 6 and 14 dollars). It also helps to use a "dumber" model to more easily see the emergent behaviors of the memory strategies.
+
+## HARNESS EVALUATION:
+I used two different things. One: LLM Judge and Two: Deterministic keyword match
+
+If they disagreed, the keyword match wins. This turned out to be important: the LLM judge gave false negatives on about 8% of probes, and the keyword layer caught every one of them.
+
+NOTE: In hinesight, I should've probably used a different model than Haiku for the LLM Judge, since it's not great to evaluate a model with itself and also, it clearly didn't evaluate some results correctly (as seen in the streamlit/loom), but luckily, the two phase approach with teh keyword match was able to correct for these :) 
+
+## SUMMARY OF RESULTS
+Six strategies, eight scenarios, 48 total trials. 522 conversation turns processed, about 6 million tokens consumed. 72 out of 114 probes passed -- a 63% overall rate. The hardest scenario was Cross-Session Memory at 11% average pass, and the easiest was Style Preference at 100%
 
 ## What I Found
 
