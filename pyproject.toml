@@ -10,6 +10,7 @@ dependencies = [
     "langchain-anthropic",
     "langchain-google-genai",
     "python-dotenv",
+    "streamlit>=1.54.0",
 ]
 
 [project.scripts]
