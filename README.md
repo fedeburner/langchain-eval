@@ -4,6 +4,19 @@ This started as a barebones CLI chat agent on [LangChain Deep Agents](https://gi
 
 The question I wanted to answer: **how do different memory approaches actually affect an agent's ability to recall facts, deal with contradictions, and hold context over long conversations?**
 
+## Strategies used:
+**Full Buffer **is the simplest possible approach. It keeps every single message -- every user input and every agent response -- and sends the entire conversation to the model each turn. The advantage is obvious: the model always has full context, so it never forgets anything. The disadvantage is equally obvious: your token count grows linearly with conversation length. In our 26-turn Deep Conversation scenario, it went from 6,000 tokens to over 111,000. For a platform where agents run for hours every day, that's a cost and latency problem.
+
+**Summary** takes a different approach. It monitors the conversation's total token count, and when it crosses a threshold -- I set it to 4,000 tokens -- it calls the LLM to compress all the older messages into a running summary paragraph. After that, it sends the summary plus the most recent turns. So you get a compressed version of the history without the unbounded growth. The trade-off is that specific details can get lost in the compression -- the LLM might summarize 'the user has a wife named Sarah who is a nurse' into something more general, or drop it entirely if there's a lot of other content.
+
+**Long-Term Profile** uses a completely different approach -- structured extraction. Instead of sending raw conversation history, it scans each user message with regex patterns looking for specific facts: name, location, profession, pet information, preferences. It stores these in a structured dictionary and injects them as a system message each turn, alongside a sliding window of recent messages. The unique thing about Long-Term Profile specifically is that it persists this dictionary to a JSON file on disk, so when you start a new session, it loads the previous profile back. It's the only strategy with cross-session memory.
+
+**Profile** is the same as Long-Term Profile but without the disk persistence. It extracts facts with the same regex patterns and keeps the same structured dictionary, but when the session ends, everything is gone. I included both to test whether the persistence layer matters.
+
+**Hybrid** tries to get the best of everything. It combines the Profile extractor, the Summary compressor, and a recent-turn window. The idea is that structured extraction catches user facts, summarization preserves general context, and the window keeps the most recent exchanges fresh. In theory this should dominate. In practice -- and this was one of the most surprising findings -- it doesn't always. It inherits the weaknesses of each component, and sometimes those weaknesses cancel out each other's strengths.
+
+**Window** is the most minimal strategy. It just keeps the last K exchanges -- I defaulted K to 6 -- and drops everything older. This gives you constant token usage regardless of conversation length, which is great for cost control. But any fact mentioned more than 6 turns ago is permanently lost. It's useful for low-context interactions where you genuinely don't need long-term recall.
+
 ## What I Found
 
 Going in, I figured Full Buffer (just keep everything) would win on quality and the interesting part would be the cost trade-offs. That turned out to be only partly true. Some things I didn't expect:
