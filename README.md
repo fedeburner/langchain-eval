@@ -4,53 +4,62 @@ This started as a barebones CLI chat agent on [LangChain Deep Agents](https://gi
 
 The question I wanted to answer: **how do different memory approaches actually affect an agent's ability to recall facts, deal with contradictions, and hold context over long conversations?**
 
-## Strategies used:
-**Full Buffer** is the simplest possible approach. It keeps every single message -- every user input and every agent response -- and sends the entire conversation to the model each turn. The advantage is obvious: the model always has full context, so it never forgets anything. The disadvantage is equally obvious: your token count grows linearly with conversation length. In our 26-turn Deep Conversation scenario, it went from 6,000 tokens to over 111,000. For a platform where agents run for hours every day, that's a cost and latency problem.
+## Memory Strategies
 
-**Summary** takes a different approach. It monitors the conversation's total token count, and when it crosses a threshold -- I set it to 4,000 tokens -- it calls the LLM to compress all the older messages into a running summary paragraph. After that, it sends the summary plus the most recent turns. So you get a compressed version of the history without the unbounded growth. The trade-off is that specific details can get lost in the compression -- the LLM might summarize 'the user has a wife named Sarah who is a nurse' into something more general, or drop it entirely if there's a lot of other content.
+I went with six strategies that cover a pretty wide range of the design space:
 
-**Long-Term Profile** uses a completely different approach -- structured extraction. Instead of sending raw conversation history, it scans each user message with regex patterns looking for specific facts: name, location, profession, pet information, preferences. It stores these in a structured dictionary and injects them as a system message each turn, alongside a sliding window of recent messages. The unique thing about Long-Term Profile specifically is that it persists this dictionary to a JSON file on disk, so when you start a new session, it loads the previous profile back. It's the only strategy with cross-session memory.
+**Full Buffer** just keeps everything. Every message stays in the context window forever. Best possible recall, but token count grows without bound. Works fine for short chats, gets expensive fast for long ones.
 
-**Profile** is the same as Long-Term Profile but without the disk persistence. It extracts facts with the same regex patterns and keeps the same structured dictionary, but when the session ends, everything is gone. I included both to test whether the persistence layer matters.
+**Sliding Window** uses LangChain's `trim_messages` to keep only the last K exchanges (I defaulted to 6). Token usage stays flat no matter how long the conversation runs. The obvious downside is that anything older than K turns is permanently gone.
 
-**Hybrid** tries to get the best of everything. It combines the Profile extractor, the Summary compressor, and a recent-turn window. The idea is that structured extraction catches user facts, summarization preserves general context, and the window keeps the most recent exchanges fresh. In theory this should dominate. In practice -- and this was one of the most surprising findings -- it doesn't always. It inherits the weaknesses of each component, and sometimes those weaknesses cancel out each other's strengths.
+**Running Summary** watches the token count and, once it crosses a threshold, asks the LLM to compress older messages into a paragraph. After that it sends the summary plus recent turns. This preserves the general shape of the conversation without the linear cost growth, but specific details can get lost in the compression.
 
-**Window** is the most minimal strategy. It just keeps the last K exchanges -- I defaulted K to 6 -- and drops everything older. This gives you constant token usage regardless of conversation length, which is great for cost control. But any fact mentioned more than 6 turns ago is permanently lost. It's useful for low-context interactions where you genuinely don't need long-term recall.
+**Structured Profile** scans each user message with regex patterns looking for facts like name, location, profession, and pet info. It stores these in a dictionary and injects them as a system message each turn, alongside a recent-turn window. The upside is that it's very interpretable (you can literally see what it "knows"). The downside is it only catches facts that match its patterns.
 
-## Scenarios Tested:
+**Hybrid** layers all three together: profile extraction, running summary, and recent window. In theory this should be the best of everything. In practice it mostly is, but it also inherits each component's weaknesses. The Profile regex bug affects Hybrid too, for example.
 
-**Long-Range Recall** is the baseline scenario. The user states three facts -- their name, their dog's name and breed, and their city -- then asks five unrelated questions about Mongolia, airplanes, octopuses, things like that. Then we probe: 'What's my dog's name?' 'Where do I live?' This tests whether facts from early in the conversation survive after filler pushes them back.
+**Long-Term Profile** is the same as Profile but it writes the extracted facts to a JSON file on disk. When a session ends and a new one starts, it loads the previous profile back. This is the only strategy that remembers anything across session boundaries.
 
-**Conflict Resolution** tests what happens when a fact changes. The user says 'I live in Austin,' then later says 'Actually I moved to Denver.' We probe for both the current and previous location. This catches strategies that might confuse old and new values.
+---
 
-**Compositional Recall** requires the agent to combine facts from separate turns. The user mentions their name in one turn, their team in another turn, their favorite language in another. Then we ask 'What's my name and what team do I lead?' -- the agent has to pull from two different turns and synthesize.
+## Evaluation Approach
 
-**Noise Robustnes**s buries two important facts -- an emergency contact name and a blood type -- under six turns of heavy irrelevant chatter, then probes for them. This tests whether the strategy can separate signal from noise.
+### Scenarios
 
-**Style Preference** checks whether the agent remembers meta-instructions, not just facts. The user says 'please use concise bullet points,' then asks a couple questions, then we probe whether the agent remembers the style preference and actually applies it. (**_Note_**: this was a cursor suggestion it snuck in. I decided to leave it in as an additional datapoint, but it's kinda tangential).
+Instead of one big generic conversation, I wrote eight scenarios that each test a specific thing. The idea is that when something fails, the scenario name tells you what kind of memory problem caused it.
 
-**Cross-Session Memory **is the hardest. The user states three facts, then we simulate a session break -- all in-memory state is wiped. In the new session we probe for the facts, then the user updates one of them, then we do another session break and probe again. Only strategies with a persistence layer can survive this.
+| Scenario | What it tests | Turns |
+|----------|---------------|-------|
+| Long-Range Recall | Do facts from early turns survive after lots of filler? | 11 |
+| Conflict Resolution | When the user corrects a fact, does the agent use the new value? | 7 |
+| Compositional Recall | Can it combine facts from separate, non-adjacent turns? | 9 |
+| Noise Robustness | Do important facts survive heavy irrelevant chatter? | 10 |
+| Style Preference | Does it remember response-format instructions? | 5 |
+| Cross-Session Memory | After a session reset, is anything retained? | 9 |
+| Deep Conversation | After 20+ filler turns, can it recall details from turn 2? | 26 |
+| Repeated Updates | When the same fact changes 3 times, does it track the latest? | 10 |
 
-**Deep Conversation** is the longest at 26 turns. The user states three facts at the very start -- their job, their wife's name, their cats' names -- then there are 20 filler turns asking about technical topics like DNS, OAuth, MapReduce. At the end, we probe for those original facts. This is where you really see the strategies diverge, because 20 filler turns is enough to push facts out of any window and enough to stress-test summarization quality.
-
-**Repeated Updates** changes the same fact three times. The user says 'I live in Austin,' then 'I moved to Denver,' then 'I relocated to Seattle.' We probe for the current city and the full history. This tests whether strategies can track the latest value and remember the sequence of changes.
+Each scenario has three turn types: **fact** turns where the user states something memorable, **filler** turns with unrelated questions that push facts further back in history, and **probe** turns that ask the agent to recall specific facts.
 
 ## MODEL USED:
 Everything runs on Claude Haiku. I chose it because it's fast and cheap enough to run all 48 trials, which is about 6 million tokens (which ended up being between 6 and 14 dollars). It also helps to use a "dumber" model to more easily see the emergent behaviors of the memory strategies.
 
-## HARNESS EVALUATION:
-I used two different things. One: LLM Judge and Two: Deterministic keyword match
+### Scoring
+
+Every probe gets scored two ways:
+
+1. An **LLM judge** (Claude Haiku) reads the agent's answer and the expected fact and decides if they match.
+2. A **keyword matcher** checks for specific expected strings in the response.
 
 If they disagreed, the keyword match wins. This turned out to be important: the LLM judge gave false negatives on about 8% of probes, and the keyword layer caught every one of them.
 
 NOTE: In hinesight, I should've probably used a different model than Haiku for the LLM Judge, since it's not great to evaluate a model with itself and also, it clearly didn't evaluate some results correctly (as seen in the streamlit/loom), but luckily, the two phase approach with teh keyword match was able to correct for these :) 
 
+
 ## SUMMARY OF RESULTS
 Six strategies, eight scenarios, 48 total trials. 522 conversation turns processed, about 6 million tokens consumed. 72 out of 114 probes passed -- a 63% overall rate. The hardest scenario was Cross-Session Memory at 11% average pass, and the easiest was Style Preference at 100%
 
-## What I Found
-
-Going in, I figured Full Buffer (just keep everything) would win on quality and the interesting part would be the cost trade-offs. That turned out to be only partly true. Some things I didn't expect:
+## DEEPER FUN FINDINGS:
 
 **Hybrid and Summary have complementary blind spots.** This was the most surprising result. I assumed Hybrid (Profile + Summary + Window combined) would dominate since it theoretically gets the best of each piece. Instead, Hybrid won on Deep Conversation (100% vs Summary's 0%) because its Profile extractor caught things like "wife's name is Sarah" that the summarizer compressed away. But then Summary won on Noise Robustness (100% vs Hybrid's 0%) because LLM compression kept "emergency contact is Alice" alive -- a fact that didn't match any of Profile's regex patterns. So combining strategies can actually hurt if one component drops facts the other would have kept.
 
@@ -61,6 +70,8 @@ Going in, I figured Full Buffer (just keep everything) would win on quality and 
 **Summary barely ever summarizes.** The summarization logic only kicked in on 1 of the 8 scenarios. The rest were short enough that the token threshold was never hit, so Summary just acted like Full Buffer. I could have lowered the threshold to force more summarization, but that would be tuning the strategy to fit the benchmark rather than testing the strategy as designed. The finding itself is useful: in real usage, most conversations are short enough that Summary provides no benefit over Full Buffer -- its cost savings only matter for genuinely long sessions.
 
 **The evaluator disagrees with itself.** I scored each probe two ways -- an LLM judge and a keyword matcher. They disagreed on ~8% of probes. Every time, the LLM judge gave a false negative (said the answer was wrong when it was actually right). The keyword fallback caught all of these. It's a good reminder that LLM-based eval needs a sanity-check layer.
+
+---
 
 ## Getting Started
 
@@ -115,54 +126,6 @@ uv run streamlit run app/dashboard.py
 ```
 
 The dashboard is one scrollable page. At the top there's an overview of the full benchmark scope (strategies, scenarios, total turns, tokens consumed), a strategy ranking table, and five key findings. Then there's a color-coded scorecard grid -- green for 100% recall, yellow for partial, red for 0%. Click any cell and it shows you the actual conversation with a verdict panel next to it: what the agent was asked, what it said, whether it passed, why it failed, and what was in memory when the probe happened. At the bottom there's a table comparing how all six strategies handled the same probes.
-
----
-
-## Memory Strategies
-
-I went with six strategies that cover a pretty wide range of the design space:
-
-**Full Buffer** just keeps everything. Every message stays in the context window forever. Best possible recall, but token count grows without bound. Works fine for short chats, gets expensive fast for long ones.
-
-**Sliding Window** uses LangChain's `trim_messages` to keep only the last K exchanges (I defaulted to 6). Token usage stays flat no matter how long the conversation runs. The obvious downside is that anything older than K turns is permanently gone.
-
-**Running Summary** watches the token count and, once it crosses a threshold, asks the LLM to compress older messages into a paragraph. After that it sends the summary plus recent turns. This preserves the general shape of the conversation without the linear cost growth, but specific details can get lost in the compression.
-
-**Structured Profile** scans each user message with regex patterns looking for facts like name, location, profession, and pet info. It stores these in a dictionary and injects them as a system message each turn, alongside a recent-turn window. The upside is that it's very interpretable (you can literally see what it "knows"). The downside is it only catches facts that match its patterns.
-
-**Hybrid** layers all three together: profile extraction, running summary, and recent window. In theory this should be the best of everything. In practice it mostly is, but it also inherits each component's weaknesses. The Profile regex bug affects Hybrid too, for example.
-
-**Long-Term Profile** is the same as Profile but it writes the extracted facts to a JSON file on disk. When a session ends and a new one starts, it loads the previous profile back. This is the only strategy that remembers anything across session boundaries.
-
----
-
-## Evaluation Approach
-
-### Scenarios
-
-Instead of one big generic conversation, I wrote eight scenarios that each test a specific thing. The idea is that when something fails, the scenario name tells you what kind of memory problem caused it.
-
-| Scenario | What it tests | Turns |
-|----------|---------------|-------|
-| Long-Range Recall | Do facts from early turns survive after lots of filler? | 11 |
-| Conflict Resolution | When the user corrects a fact, does the agent use the new value? | 7 |
-| Compositional Recall | Can it combine facts from separate, non-adjacent turns? | 9 |
-| Noise Robustness | Do important facts survive heavy irrelevant chatter? | 10 |
-| Style Preference | Does it remember response-format instructions? | 5 |
-| Cross-Session Memory | After a session reset, is anything retained? | 9 |
-| Deep Conversation | After 20+ filler turns, can it recall details from turn 2? | 26 |
-| Repeated Updates | When the same fact changes 3 times, does it track the latest? | 10 |
-
-Each scenario has three turn types: **fact** turns where the user states something memorable, **filler** turns with unrelated questions that push facts further back in history, and **probe** turns that ask the agent to recall specific facts.
-
-### Scoring
-
-Every probe gets scored two ways:
-
-1. An **LLM judge** (Claude Haiku) reads the agent's answer and the expected fact and decides if they match.
-2. A **keyword matcher** checks for specific expected strings in the response.
-
-When they disagree, the keyword match wins. This ended up mattering more than I expected -- the LLM judge had false negatives on about 8% of probes, and the keyword fallback caught all of them.
 
 ---
 
